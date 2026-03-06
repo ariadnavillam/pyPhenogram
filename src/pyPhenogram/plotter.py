@@ -23,12 +23,16 @@ MAX_H = 340  # height of chr1 (longest chromosome)
 CAP_H = 7  # bezier cap protrusion above / below chromosome body
 ROW_GAP = 50  # gap between row 0 labels and row 1 top caps
 LABEL_H = 18  # space reserved below each chromosome for its number
-DOT_OFFSET = 13      # horizontal distance from chr right edge to dot centre
-DOT_R = 3.5          # radius of GWAS hit dot
-ELBOW_X_OFFSET = 5   # horizontal stub before the elbow turn
+DOT_OFFSET = 13  # horizontal distance from chr right edge to dot centre
+DOT_R = 5.0  # radius of GWAS hit dot
+ELBOW_X_OFFSET = 5  # horizontal stub before the elbow turn
 
 CHR_COLOR = "#DCDCDC"
 OUTLINE_COLOR = "#555555"
+
+# P-value thresholds
+P_GENOME_WIDE = 5e-8  # genome-wide significance → diamond marker
+DIAMOND_R_SCALE = 1.3  # diamond half-diagonal relative to DOT_R
 
 # Row bottom y-coordinates (SVG: y increases downward)
 # "Bottom" = q-arm tip of the chromosome body
@@ -163,7 +167,9 @@ def _outline_path(cx, y_bottom, chr_h, cent_yt, cent_ym, cent_yb):
 # ---------------------------------------------------------------------------
 
 
-def _add_chromosome(g, chrom_num, bands_chr, hits, color_map, chr_sizes):
+def _add_chromosome(
+    g, chrom_num, bands_chr, hits, color_map, chr_sizes, p_genome_wide=P_GENOME_WIDE
+):
     """Append SVG elements for one chromosome to the group element *g*."""
     cx, y_bottom, chr_h = _chr_params(chrom_num, chr_sizes)
     chr_size = chr_sizes[chrom_num]
@@ -246,36 +252,58 @@ def _add_chromosome(g, chrom_num, bands_chr, hits, color_map, chr_sizes):
     # 6. GWAS hit dots with elbow connectors
     # Dots are stacked to avoid overlap; elbow lines connect each dot back
     # to its true position on the chromosome.
-    dot_x   = cx + CHR_HW + DOT_OFFSET
+    # hits entries: (pos_bp, label, pval)  — pval may be None
+    # Marker shape: diamond when pval < p_genome_wide, circle otherwise.
+    dot_x = cx + CHR_HW + DOT_OFFSET
     elbow_x = cx + CHR_HW + ELBOW_X_OFFSET
-    min_sep = DOT_R * 2 + 2   # minimum pixel gap between dot centres
+    min_sep = DOT_R * 2 + 2  # minimum pixel gap between dot centres
 
     if hits:
-        y_chrs = [_bp_to_y(pos, y_bottom, chr_h, chr_size) for pos, _ in hits]
+        y_chrs = [_bp_to_y(pos, y_bottom, chr_h, chr_size) for pos, _, _ in hits]
         y_dots = _stack_positions(y_chrs, min_sep)
 
-        for (pos_bp, label), y_chr, y_dot in zip(hits, y_chrs, y_dots):
+        for (pos_bp, label, pval), y_chr, y_dot in zip(hits, y_chrs, y_dots):
             color = color_map.get(label, "#333333")
+            is_gws = (pval is not None) and (pval < p_genome_wide)
 
             # Elbow path: chr edge → short stub → vertical → dot
             connector = ET.SubElement(g, "path")
-            connector.set("d", (
-                f"M {_f(cx + CHR_HW)},{_f(y_chr)} "
-                f"L {_f(elbow_x)},{_f(y_chr)} "
-                f"L {_f(elbow_x)},{_f(y_dot)} "
-                f"L {_f(dot_x)},{_f(y_dot)}"
-            ))
+            connector.set(
+                "d",
+                (
+                    f"M {_f(cx + CHR_HW)},{_f(y_chr)} "
+                    f"L {_f(elbow_x)},{_f(y_chr)} "
+                    f"L {_f(elbow_x)},{_f(y_dot)} "
+                    f"L {_f(dot_x)},{_f(y_dot)}"
+                ),
+            )
             connector.set("fill", "none")
             connector.set("stroke", color)
             connector.set("stroke-width", "0.9")
 
-            dot = ET.SubElement(g, "circle")
-            dot.set("cx", _f(dot_x))
-            dot.set("cy", _f(y_dot))
-            dot.set("r",  _f(DOT_R))
-            dot.set("fill",   color)
-            dot.set("stroke", "white")
-            dot.set("stroke-width", "0.7")
+            if is_gws:
+                # Genome-wide significant: draw a rotated-square (diamond) marker
+                r = DOT_R * DIAMOND_R_SCALE
+                diamond = ET.SubElement(g, "polygon")
+                diamond.set(
+                    "points",
+                    f"{_f(dot_x)},{_f(y_dot - r)} "
+                    f"{_f(dot_x + r)},{_f(y_dot)} "
+                    f"{_f(dot_x)},{_f(y_dot + r)} "
+                    f"{_f(dot_x - r)},{_f(y_dot)}",
+                )
+                diamond.set("fill", color)
+                diamond.set("stroke", "white")
+                diamond.set("stroke-width", "0.7")
+            else:
+                # Suggestive / no p-value: draw a circle marker
+                dot = ET.SubElement(g, "circle")
+                dot.set("cx", _f(dot_x))
+                dot.set("cy", _f(y_dot))
+                dot.set("r", _f(DOT_R))
+                dot.set("fill", color)
+                dot.set("stroke", "white")
+                dot.set("stroke-width", "0.7")
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +341,70 @@ def _add_legend(svg, color_map, color_col, x, y_start):
         txt.text = str(label)
 
 
+def _add_shape_legend(svg, x, y_start, p_genome_wide):
+    """Append a marker-shape legend explaining circle vs diamond significance."""
+    r = DOT_R * DIAMOND_R_SCALE
+    g = ET.SubElement(svg, "g")
+
+    title = ET.SubElement(g, "text")
+    title.set("x", _f(x))
+    title.set("y", _f(y_start))
+    title.set("font-family", "sans-serif")
+    title.set("font-size", "10")
+    title.set("font-weight", "bold")
+    title.set("fill", "#333333")
+    title.text = "Significance"
+
+    # Row 1: diamond = genome-wide significant
+    y1 = y_start + 18
+    diamond = ET.SubElement(g, "polygon")
+    diamond.set(
+        "points",
+        f"{_f(x + 6)},{_f(y1 - 1 - r)} "
+        f"{_f(x + 6 + r)},{_f(y1 - 1)} "
+        f"{_f(x + 6)},{_f(y1 - 1 + r)} "
+        f"{_f(x + 6 - r)},{_f(y1 - 1)}",
+    )
+    diamond.set("fill", "#555555")
+    diamond.set("stroke", "white")
+    diamond.set("stroke-width", "0.7")
+
+    txt1 = ET.SubElement(g, "text")
+    txt1.set("x", _f(x + 16))
+    txt1.set("y", _f(y1 + 3))
+    txt1.set("font-family", "sans-serif")
+    txt1.set("font-size", "9")
+    txt1.set("fill", "#333333")
+    exp = f"{p_genome_wide:.0e}".replace("e-0", "×10⁻").replace("e-", "×10⁻")
+    txt1.text = f"p < {exp} (GWS)"
+
+    # Row 2: circle = suggestive
+    y2 = y_start + 36
+    circle = ET.SubElement(g, "circle")
+    circle.set("cx", _f(x + 6))
+    circle.set("cy", _f(y2 - 1))
+    circle.set("r", _f(DOT_R))
+    circle.set("fill", "#555555")
+    circle.set("stroke", "white")
+    circle.set("stroke-width", "0.7")
+
+    txt2 = ET.SubElement(g, "text")
+    txt2.set("x", _f(x + 16))
+    txt2.set("y", _f(y2 + 3))
+    txt2.set("font-family", "sans-serif")
+    txt2.set("font-size", "9")
+    txt2.set("fill", "#333333")
+    txt2.text = "Suggestive"
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 
-def plot_all_chromosomes(df, color_col, output_path, cmap=None):
+def plot_all_chromosomes(
+    df, color_col, output_path, cmap=None, p_col=None, p_genome_wide=P_GENOME_WIDE
+):
     """
     Draw all 22 chromosomes with Giemsa bands and GWAS hit markers to SVG.
 
@@ -333,6 +419,13 @@ def plot_all_chromosomes(df, color_col, output_path, cmap=None):
     cmap : str or None
         Matplotlib colormap name (e.g. "tab10", "viridis").  When None the
         default HSV hue-wheel spacing is used.
+    p_col : str or None
+        Column containing p-values.  When provided, markers with
+        p < *p_genome_wide* are drawn as diamonds (genome-wide significant);
+        all others as circles (suggestive).  When None every marker is a
+        circle (backward-compatible behaviour).
+    p_genome_wide : float
+        P-value threshold for genome-wide significance (default 5e-8).
 
     Returns
     -------
@@ -373,10 +466,31 @@ def plot_all_chromosomes(df, color_col, output_path, cmap=None):
     for chrom_num in range(1, 23):
         bands_chr = bands[bands["chrom"] == chrom_num]
         chrom_df = df[df["CHR"] == chrom_num]
-        hits = [(row["POS"], row[color_col]) for _, row in chrom_df.iterrows()]
-        _add_chromosome(g_chroms, chrom_num, bands_chr, hits, color_map, chr_sizes)
+        if p_col is not None and p_col in chrom_df.columns:
+            hits = [
+                (row["POS"], row[color_col], row[p_col])
+                for _, row in chrom_df.iterrows()
+            ]
+        else:
+            hits = [
+                (row["POS"], row[color_col], None) for _, row in chrom_df.iterrows()
+            ]
+        _add_chromosome(
+            g_chroms,
+            chrom_num,
+            bands_chr,
+            hits,
+            color_map,
+            chr_sizes,
+            p_genome_wide=p_genome_wide,
+        )
 
     _add_legend(svg, color_map, color_col, legend_x, MARGIN_T + 10)
+
+    if p_col is not None:
+        color_legend_h = 18 + len(color_map) * 18 + 20
+        shape_legend_y = MARGIN_T + 10 + color_legend_h
+        _add_shape_legend(svg, legend_x, shape_legend_y, p_genome_wide)
 
     svg_path = output_path.with_suffix(".svg")
     tree = ET.ElementTree(svg)
